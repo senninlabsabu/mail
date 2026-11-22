@@ -1,7 +1,11 @@
 const { createClient } = require('@supabase/supabase-js');
+// Node.js 20 は WebSocket が組み込みでないため、supabase-js (realtime) に ws を渡す。
+// Node.js 22 以上でも問題なく動作する。
+const ws = require('ws');
 
 const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
+  realtime: { transport: ws },
 });
 
 // Supabase のレスポンスを検査し、エラーなら Postgres のエラーコードを保持して投げる
