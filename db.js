@@ -18,7 +18,8 @@ function must(res, label) {
   return res.data;
 }
 
-const USER_COLS = 'id,username,role,status,reason,created_at';
+const USER_COLS = 'id,username,role,status,created_at';
+const USER_DETAIL_COLS = USER_COLS + ',real_name,age,gender,ip_address,user_agent,accept_language,last_login_at,last_login_ip,last_login_ua';
 
 // --- users ---
 async function findUserByName(username) {
@@ -27,6 +28,16 @@ async function findUserByName(username) {
 
 async function findUserById(id) {
   return must(await sb.from('users').select(USER_COLS).eq('id', id).maybeSingle(), 'findUserById');
+}
+
+async function findUserDetail(id) {
+  return must(await sb.from('users').select(USER_DETAIL_COLS).eq('id', id).maybeSingle(), 'findUserDetail');
+}
+
+async function updateLastLogin(id, ip, ua) {
+  must(await sb.from('users').update({
+    last_login_at: new Date().toISOString(), last_login_ip: ip, last_login_ua: ua,
+  }).eq('id', id), 'updateLastLogin');
 }
 
 async function insertUser(row) {
@@ -42,7 +53,7 @@ async function countOpenByFingerprint(fp) {
 
 async function listPending() {
   return must(
-    await sb.from('users').select(USER_COLS).eq('status', 'pending').order('created_at', { ascending: true }),
+    await sb.from('users').select(USER_DETAIL_COLS).eq('status', 'pending').order('created_at', { ascending: true }),
     'listPending'
   );
 }
@@ -90,9 +101,17 @@ async function transition(id, fromStatuses, toStatus) {
 // --- messages ---
 async function listMessages(userId, limit = 100) {
   return must(
-    await sb.from('messages').select('id,title,body,kind,created_at,read_at')
+    await sb.from('messages').select('id,title,body,kind,format,created_at,read_at')
       .eq('user_id', userId).order('id', { ascending: false }).limit(limit),
     'listMessages'
+  );
+}
+
+async function getMessageForUser(id, userId) {
+  return must(
+    await sb.from('messages').select('id,title,body,kind,format,created_at,read_at')
+      .eq('id', id).eq('user_id', userId).maybeSingle(),
+    'getMessageForUser'
   );
 }
 
@@ -139,10 +158,95 @@ async function listAudit(limit = 200) {
   }));
 }
 
+// --- 送信履歴 ---
+async function insertBatch(row) {
+  return must(await sb.from('sent_batches').insert(row).select('id').single(), 'insertBatch');
+}
+
+const BATCH_COLS = 'id,title,body,kind,format,source,recipient_count,created_at,sender:users(username),app:apps(name)';
+
+async function listBatches(page, size) {
+  const from = (page - 1) * size;
+  const res = await sb.from('sent_batches').select(BATCH_COLS, { count: 'exact' })
+    .order('id', { ascending: false }).range(from, from + size - 1);
+  return { rows: must(res, 'listBatches'), total: res.count ?? 0 };
+}
+
+async function getBatch(id) {
+  return must(await sb.from('sent_batches').select(BATCH_COLS).eq('id', id).maybeSingle(), 'getBatch');
+}
+
+async function batchRecipients(batchId, limit = 200) {
+  const res = await sb.from('messages').select('id,read_at,user:users(id,username)', { count: 'exact' })
+    .eq('batch_id', batchId).order('id', { ascending: true }).limit(limit);
+  const rows = must(res, 'batchRecipients');
+  const readRes = await sb.from('messages').select('id', { count: 'exact', head: true })
+    .eq('batch_id', batchId).not('read_at', 'is', null);
+  must(readRes, 'batchReadCount');
+  return { rows, total: res.count ?? 0, read: readRes.count ?? 0 };
+}
+
+// --- 外部アプリ / 認証コード ---
+async function insertApp(row) {
+  return must(await sb.from('apps').insert(row).select('id,name').single(), 'insertApp');
+}
+async function listApps() {
+  return must(
+    await sb.from('apps').select('id,name,status,created_at,last_used_at').order('id', { ascending: false }),
+    'listApps'
+  );
+}
+async function findAppByKeyHash(hash) {
+  return must(await sb.from('apps').select('id,name,status').eq('key_hash', hash).maybeSingle(), 'findAppByKeyHash');
+}
+async function touchApp(id) {
+  await sb.from('apps').update({ last_used_at: new Date().toISOString() }).eq('id', id);
+}
+async function setAppStatus(id, status) {
+  const rows = must(await sb.from('apps').update({ status }).eq('id', id).select('id'), 'setAppStatus');
+  return rows.length > 0;
+}
+async function deleteApp(id) {
+  const rows = must(await sb.from('apps').delete().eq('id', id).select('id'), 'deleteApp');
+  return rows.length > 0;
+}
+
+async function insertCode(row) {
+  return must(await sb.from('auth_codes').insert(row).select('id').single(), 'insertCode');
+}
+async function getCode(id) {
+  return must(await sb.from('auth_codes').select('*').eq('id', id).maybeSingle(), 'getCode');
+}
+async function countRecentCodes(appId, userId, sinceIso) {
+  const res = await sb.from('auth_codes').select('id', { count: 'exact', head: true })
+    .eq('app_id', appId).eq('user_id', userId).gte('created_at', sinceIso);
+  must(res, 'countRecentCodes');
+  return res.count ?? 0;
+}
+// 試行回数を原子的に +1 (他の同時試行に負けたら false)
+async function bumpAttempts(id, current) {
+  const rows = must(
+    await sb.from('auth_codes').update({ attempts: current + 1 }).eq('id', id).eq('attempts', current).select('id'),
+    'bumpAttempts'
+  );
+  return rows.length > 0;
+}
+// 未使用の場合のみ使用済みにする (二重使用防止)
+async function markCodeUsed(id) {
+  const rows = must(
+    await sb.from('auth_codes').update({ used_at: new Date().toISOString() }).eq('id', id).is('used_at', null).select('id'),
+    'markCodeUsed'
+  );
+  return rows.length > 0;
+}
+
 module.exports = {
   sb, must,
-  findUserByName, findUserById, insertUser, countOpenByFingerprint,
+  findUserByName, findUserById, findUserDetail, updateLastLogin, insertUser, countOpenByFingerprint,
   listPending, listUsers, listActiveRegularUsers, activeRegularUserIds, transition,
-  listMessages, insertMessages, markRead, countUnread,
+  listMessages, getMessageForUser, insertMessages, markRead, countUnread,
+  insertBatch, listBatches, getBatch, batchRecipients,
+  insertApp, listApps, findAppByKeyHash, touchApp, setAppStatus, deleteApp,
+  insertCode, getCode, countRecentCodes, bumpAttempts, markCodeUsed,
   insertAudit, listAudit,
 };
